@@ -1,0 +1,913 @@
+---
+title: "COVID-19 Brain Aging"
+output:
+  word_document: default
+  html_document: default
+  pdf_document: default
+Authors: Jonathan Lee
+Last updated: 11/15/2021
+---
+
+```{r setup, include=FALSE}
+library(preprocessCore)
+library(limma)
+library(stringr)
+library(ggplot2)
+library(ggrepel)
+library(GO.db)
+library(gProfileR)
+library(reactome.db)
+library(fgsea)
+library(biomaRt)
+library(org.Hs.eg.db)
+library(dplyr)
+library(reshape2)
+library(pheatmap)
+library(tximport)
+library(KEGGREST)
+library(DESeq2)
+library(Rtsne)
+library(viridis)
+
+gg_color_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+```
+
+# RNA-seq analysis
+
+To run this script, we need the following files:
+- CONTROL1-12.salmon.sf (12x files, control samples), available from GEO
+- COVID1-12.salmon.sf (12x files, COVID samples), available from GEO
+- TableS1_patient_info.csv - patient cohort info, from Supplementary Table 1
+- tx2gene.txt - mapping of gene annotations, available via GitHub or biomaRt (or as supplementary file)
+- master_aging_genesets.txt - available from Supplementary Table 4a
+
+# Assessing reads aligning to SARS-2 genome
+
+1. Download the SARS-CoV-2 genome sequence (NCBI reference sequence NC_045512.2) as a .fasta file from https://www.ncbi.nlm.nih.gov/nuccore/1798174254.
+
+2. Generate bowtie2 (v2.2.9) index with default parameters
+
+3. Align .fastq files to SARS-CoV-2 genome via bowtie2 - determine % aligned reads from bowtie2 output
+- Samples from this study: bowtie2 parameters "-X 1000 --no-mixed" for paired-end analysis
+- "Positive control" samples (Calu-3 +/- SARS-CoV-2 from Blanco-Melo et al. Cell 2020. (https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE147507): default bowtie2 parameters for single-end analysis
+
+"Positive control" sample IDs used:
+GSM4462348	Series7_Calu3_Mock_1
+GSM4462349	Series7_Calu3_Mock_2
+GSM4462350	Series7_Calu3_Mock_3
+GSM4462351	Series7_Calu3_SARS-CoV-2_1
+GSM4462352	Series7_Calu3_SARS-CoV-2_2
+GSM4462353	Series7_Calu3_SARS-CoV-2_3
+
+# Aligning reads to Ensembl v104 human transcriptome
+
+```{r, eval=F}
+# download reference transcriptome as .fasta file
+wget http://ftp.ensembl.org/pub/release-104/fasta/homo_sapiens/cdna/Homo_sapiens.GRCh38.cdna.all.fa.gz
+
+# generate salmon reference index (v1.4.0)
+export PATH=/n/app/bcbio/tools/bin:$PATH
+salmon index -t Homo_sapiens.GRCh38.cdna.all.fa.gz -i salmon_idx -k 31
+
+# align raw sequencing reads to reference transcriptome
+salmon quant -i $salmon_idx -l A -p $ncores -1 $dir/${base}_1.fastq -2 $dir/${base}_2.fastq -o $dir/${base}.salmon --seqBias --useVBOpt --\
+gcBias --posBias --numBootstraps 30 --validateMappings
+
+# rename output for easier identificaton
+for f in *.salmon; do cp $f/quant.sf $f.sf; done
+```
+
+# Patient sample cohort assessment
+
+```{r, eval=T}
+# create treatment sample matrix
+# from converting Table S1 to .csv
+sampleinfo <- read.csv(file="TableS1_patient_info.csv")
+row.names(sampleinfo) <- sampleinfo$Sample.ID
+sampleinfo <- subset(sampleinfo, grepl("RNA seq", Assays.used))
+sampleinfo <- sampleinfo[order(row.names(sampleinfo)),]
+sampleinfo <- sampleinfo[,c("Group", "Age..years.", "Sex", "Library.prep.batch", "Age.Sex.Matching.Group..RNA.seq.analysis")]
+colnames(sampleinfo) <- c("treatment", "Age", "Sex", "Batch", "AgeSex")
+sampleinfo$treatment <- ifelse(sampleinfo$treatment=="COVID-19", "COVID", "Control")
+
+sampleinfo$age65 <- ifelse(sampleinfo$Age <= 65, "0", "1")
+```
+
+```{r, eval=T, fig.width=2, fig.height=1}
+ggplot(sampleinfo, aes(x=treatment, fill=Batch)) + geom_bar(position=position_dodge()) + theme_classic() + ylab("Batch") + xlab("")+ coord_flip()
+
+ggplot(sampleinfo, aes(x=treatment, y=Age)) + geom_dotplot(binaxis = "y", stackdir = "center") + 
+    stat_summary(fun = mean,
+                 geom = "crossbar", width = 0.5) + theme_classic() + ylab("Age") + xlab("") + theme(legend.position="none")+ coord_flip()
+
+ggplot(sampleinfo, aes(x=treatment, fill=Sex)) + geom_bar(position=position_dodge()) + theme_classic() + ylab("Sex") + xlab("")+ coord_flip()
+```
+
+# Gene expression from Salmon
+
+```{r, eval=F}
+# Obtain ensembl annotations from biomaRt
+tx2gene <- getBM(attributes= c("ensembl_transcript_id","ensembl_gene_id", "external_gene_name", "entrezgene_id", "gene_biotype"), mart = useDataset("hsapiens_gene_ensembl", useMart("ensembl")))
+
+write.table(tx2gene, file="tx2gene.txt", sep='\t', quote=F)
+```
+
+```{r, eval=T}
+set.seed(42)
+tx2gene <- read.table(file="tx2gene.txt", sep='\t')
+
+## List all directories containing data  
+samples <- list.files(path = "rnaseq_analysis/", full.names = T, pattern=".sf")
+names(samples) <- str_replace_all(str_replace_all(samples, "rnaseq_analysis//", ""), ".salmon.sf", "")
+
+# Run tximport
+txi_gsm <- tximport(samples, type="salmon", tx2gene=tx2gene[,c("ensembl_transcript_id", "ensembl_gene_id")], countsFromAbundance="lengthScaledTPM", ignoreTxVersion = T)
+
+# Filter out transcripts with fewer than half of the samples having low/no detection (TPM < 0.1)
+txi_gsm$abundance <- txi_gsm$abundance[names(which(rowSums(txi_gsm$abundance > 0.1) > 12)),]
+txi_gsm$counts <- txi_gsm$counts[names(which(rowSums(txi_gsm$abundance > 0.1) > 12)),]
+txi_gsm$length <- txi_gsm$length[names(which(rowSums(txi_gsm$abundance > 0.1) > 12)),]
+
+txi_65under <- txi_gsm
+txi_65under$abundance <- txi_65under$abundance[,names(samples[which(sampleinfo$age65 == 0)])]
+txi_65under$counts <- txi_65under$counts[,names(samples[which(sampleinfo$age65 == 0)])]
+txi_65under$length <- txi_65under$length[,names(samples[which(sampleinfo$age65 == 0)])]
+
+txi_over65 <- txi_gsm
+txi_over65$abundance <- txi_over65$abundance[,names(samples[which(sampleinfo$age65 == 1)])]
+txi_over65$counts <- txi_over65$counts[,names(samples[which(sampleinfo$age65 == 1)])]
+txi_over65$length <- txi_over65$length[,names(samples[which(sampleinfo$age65 == 1)])]
+
+txi_female <- txi_gsm
+txi_female$abundance <- txi_female$abundance[,names(samples[which(sampleinfo$Sex == "F")])]
+txi_female$counts <- txi_female$counts[,names(samples[which(sampleinfo$Sex == "F")])]
+txi_female$length <- txi_female$length[,names(samples[which(sampleinfo$Sex == "F")])]
+
+txi_male <- txi_gsm
+txi_male$abundance <- txi_male$abundance[,names(samples[which(sampleinfo$Sex == "M")])]
+txi_male$counts <- txi_male$counts[,names(samples[which(sampleinfo$Sex == "M")])]
+txi_male$length <- txi_male$length[,names(samples[which(sampleinfo$Sex == "M")])]
+```
+
+# Clustering analysis
+
+```{r, eval=T}
+set.seed(42)
+rnaseq_dds <- DESeqDataSetFromTximport(txi_gsm, colData = sampleinfo, design = ~treatment)
+```
+
+```{r, eval=T}
+set.seed(42)
+rnaseq_vst <- assay(varianceStabilizingTransformation(rnaseq_dds))
+rnaseq_vst <- round(rnaseq_vst, 5)
+
+write.table(merge(tx2gene[!duplicated(tx2gene[,c(2:3)]),c(2:3)], rnaseq_vst, by.x=1, by.y=0), file="rnaseq_vst_counts.txt", row.names=F, quote=F, sep='\t')
+```
+
+```{r, eval=T}
+rnaseq_vst <- read.table(file="rnaseq_vst_counts.txt", header=T, sep='\t')
+rnaseq_vst <- rnaseq_vst[!duplicated(rnaseq_vst[,-c(2)]), ]
+row.names(rnaseq_vst) <- rnaseq_vst[,1]
+rnaseq_vst <- rnaseq_vst[,-c(1:2)]
+```
+
+```{r, eval=T}
+set.seed(15)
+tsne_lr <- Rtsne(t(rnaseq_vst), dims = 2, perplexity=5, max_iter = 10000)
+tsne_lr <- data.frame(colnames(rnaseq_vst), tsne_lr$Y, 
+                      Sample=colnames(rnaseq_vst), 
+                      Treatment=sampleinfo[colnames(rnaseq_vst),"treatment"],
+                      Batch=sampleinfo[colnames(rnaseq_vst),"Batch"],
+                      Age=sampleinfo[colnames(rnaseq_vst),"Age"],
+                      Sex=sampleinfo[colnames(rnaseq_vst),"Sex"])
+colnames(tsne_lr) <- c("Name", "dim1", "dim2", "Sample", "Treatment", "Batch", "Age", "Sex")
+```
+
+```{r, eval=T, fig.width=2, fig.height=1.5}
+ggplot(tsne_lr, aes(dim1, dim2)) + geom_text(aes(color=Treatment, label=Age), size=3) + theme_classic() + xlab("TSNE Dimension 1") + ylab("TSNE Dimension 2") #+ theme(legend.position = "none")
+```
+
+```{r, eval=T, fig.width=2, fig.height=1.5}
+ggplot(tsne_lr, aes(dim1, dim2)) + geom_point(aes(color=Treatment), size=3) + theme_classic() + xlab("TSNE Dimension 1") + ylab("TSNE Dimension 2") #+ theme(legend.position = "none")
+```
+
+# differential expression analysis, age + sex matching
+
+```{r, eval=T}
+set.seed(1)
+rnaseq_dds_match <- DESeqDataSetFromTximport(txi_gsm, colData = sampleinfo, design = ~treatment+AgeSex)
+rnaseq_dds_match <- DESeq(rnaseq_dds_match)
+```
+
+```{r, eval=T, echo=F}
+set.seed(1)
+results_match_covid_control <- results(rnaseq_dds_match,contrast=c("treatment","COVID", "Control"))
+results_match_covid_control <- merge(data.frame(results_match_covid_control), tx2gene[!duplicated(tx2gene[,c(2,3,4)]),c(2,3,4)], by.x=0, by.y=1)
+```
+
+```{r, eval=T, fig.width=2.8, fig.height=1.8}
+ggplot(results_match_covid_control, aes(x=log2FoldChange, y=-log10(padj))) + geom_point(pch=20, color="lightgray", alpha=0.5, data=subset(results_match_covid_control, padj > 0.05)) + geom_point(pch=20, color="indianred", data=subset(results_match_covid_control, padj < 0.05 & log2FoldChange > 0), alpha=0.5) + geom_point(pch=20, color="skyblue", data=subset(results_match_covid_control, padj < 0.05 & log2FoldChange < 0), alpha=0.5) + theme_classic()+ geom_hline(yintercept=0, lty=3) +
+  geom_hline(yintercept=-log10(0.05), lty=3, color="red") + geom_vline(xintercept=0, lty=3, color="red") + ylab("-Log10 FDR") + xlab("Log2 Fold Change, COVID-19 vs. Control\nAge/Sex-Matched") + ylim(c(-0.2, 12)) + geom_text_repel(data=results_match_covid_control[which(rank(-log10(results_match_covid_control$padj)*sign(results_match_covid_control$log2FoldChange)) %in% c(seq(1, 5, 0.5), seq(length(which(!is.na(results_match_covid_control$padj)))-6, length(which(!is.na(results_match_covid_control$padj))), 0.5)) | (results_match_covid_control$external_gene_name %in% c("ACE2", "BSG", "NRP1", "NRP2", "TMPRSS2", "TMPRSS11A", "TMPRSS11B", "FURIN", "CTSB", "CTSL", "LY6E", "IFITM1", "IFITM2", "IFITM3", "IFNAR1", "IFNAR2", "INPP4A", "GRIA1", "RHOBTB3", "GRIN3A", "MYL12A", "CALM3", "CALM1", "S100A8", "S100A9", "BCAP29", "SYNGR1") & results_match_covid_control$padj < 0.05)),], aes(label=external_gene_name), size=3, segment.alpha=0.5, force = 2, box.padding=0.1) + geom_point(data=results_match_covid_control[which(rank(-log10(results_match_covid_control$padj)*sign(results_match_covid_control$log2FoldChange)) %in% c(seq(1, 5, 0.5), seq(length(which(!is.na(results_match_covid_control$padj)))-6, length(which(!is.na(results_match_covid_control$padj))), 0.5)) | (results_match_covid_control$external_gene_name %in% c("ACE2", "BSG", "NRP1", "NRP2", "TMPRSS2", "TMPRSS11A", "TMPRSS11B", "FURIN", "CTSB", "CTSL", "LY6E", "IFITM1", "IFITM2", "IFITM3", "IFNAR1", "IFNAR2", "INPP4A", "GRIA1", "RHOBTB3", "GRIN3A", "MYL12A", "CALM3", "CALM1", "S100A8", "S100A9", "BCAP29", "SYNGR1") & results_match_covid_control$padj < 0.05)),], color="black", size=1)
+```
+
+```{r, eval=T}
+df.write <- results_match_covid_control
+colnames(df.write)[1] <- "ensembl_gene_id"
+df.write <- df.write[!duplicated(df.write[,1:8]),1:8]
+write.table(df.write, file="rnaseq_matched_covid_control.txt", quote=F, row.names=F, sep='\t')
+```
+
+# Heatmap analyses
+
+```{r, eval=T, fig.width=3, fig.height=1.5}
+rnaseq_vst_subset <- rnaseq_vst[subset(results_match_covid_control, padj < 0.05)$Row.names,]
+
+rnaseq_vst_subset <- rnaseq_vst_subset[,c(row.names(subset(sampleinfo, treatment=="Control"))[order(subset(sampleinfo, treatment=="Control")$Age)], row.names(subset(sampleinfo, treatment=="COVID"))[order(subset(sampleinfo, treatment=="COVID")$Age)])]
+
+anno_colors <- list(Group = c(Control="gray", COVID="black"),
+                    Age = rev(viridis(13)[5:12]),
+                    #Sex = c(M=inferno(5)[2], F=inferno(5)[4]),
+                    Sex = c(M="blue3", F="red3"))
+
+annotation_col <- data.frame(Group= c(rep("Control", 12), rep("COVID", 12)), 
+                             Age = sampleinfo[colnames(rnaseq_vst_subset), "Age"],
+                             Sex = sampleinfo[colnames(rnaseq_vst_subset), "Sex"],
+                             row.names=colnames(rnaseq_vst_subset))
+
+pheatmap(rnaseq_vst_subset, scale = "row", cluster_cols = F, treeheight_row=0,
+         annotation_col=annotation_col, annotation_colors = anno_colors,
+         color = c(colorRampPalette(c("blue", "white", "red"))(21)),
+         gaps_col = c(12), show_colnames = F, show_rownames=F)
+```
+
+```{r, eval=T, fig.width=3, fig.height=2}
+heatmap_genes <- subset(tx2gene, external_gene_name %in% c("ACE2", "BSG", "NRP1", "NRP2", "TMPRSS2", "TMPRSS11A", "TMPRSS11B", "FURIN", "CTSB", "CTSL", "LY6E", "IFITM1", "IFITM2", "IFITM3", "IFNAR1", "IFNAR2"))[,c("ensembl_gene_id", "external_gene_name")]
+heatmap_genes <- heatmap_genes[!duplicated(heatmap_genes),]
+rnaseq_vst_subset <- merge(rnaseq_vst, heatmap_genes, by.x=0, by.y=1)
+row.names(rnaseq_vst_subset) <- rnaseq_vst_subset$external_gene_name
+rnaseq_vst_subset <- rnaseq_vst_subset[,!(colnames(rnaseq_vst_subset) %in% c("external_gene_name", "Row.names"))]
+
+rnaseq_vst_subset <- rnaseq_vst_subset[,c(row.names(subset(sampleinfo, treatment=="Control"))[order(subset(sampleinfo, treatment=="Control")$Age)], row.names(subset(sampleinfo, treatment=="COVID"))[order(subset(sampleinfo, treatment=="COVID")$Age)])]
+
+rnaseq_vst_subset <- rnaseq_vst_subset[c("ACE2", "BSG", "NRP1", "NRP2", "TMPRSS2", "TMPRSS11A", "TMPRSS11B", "FURIN", "CTSB", "CTSL", "LY6E", "IFITM1", "IFITM2", "IFITM3", "IFNAR1", "IFNAR2"), ]
+row.names(rnaseq_vst_subset) <- c("ACE2", "BSG", "NRP1", "NRP2", "TMPRSS2", "TMPRSS11A", "TMPRSS11B", "FURIN", "CTSB", "CTSL", "LY6E", "IFITM1", "IFITM2", "IFITM3", "IFNAR1", "IFNAR2")
+
+anno_colors <- list(Group = c(Control="gray", COVID="black"),
+                    Age = rev(viridis(13)[5:12]),
+                    #Sex = c(M=inferno(5)[2], F=inferno(5)[4]),
+                    Sex = c(M="blue3", F="red3"),
+                    Class = c(Docking=plasma(6)[2], Processing=plasma(6)[3], `Viral Defense`=plasma(6)[4])
+                    )
+
+annotation_col <- data.frame(Group = c(rep("Control", 12), rep("COVID", 12)), 
+                             Age = sampleinfo[colnames(rnaseq_vst_subset), "Age"],
+                             Sex = sampleinfo[colnames(rnaseq_vst_subset), "Sex"],
+                             row.names=colnames(rnaseq_vst_subset))
+
+annotation_row <- data.frame(Class = c(rep("Docking", 4), rep("Processing", 6), rep("Viral Defense", 6)),
+                             row.names=row.names(rnaseq_vst_subset))
+
+pheatmap(rnaseq_vst_subset, scale = "row", cluster_cols = F, cluster_rows=F, treeheight_row=0,
+         annotation_col=annotation_col, annotation_row=annotation_row, annotation_colors = anno_colors,
+         color = c(colorRampPalette(c("blue", "white", "red"))(21)),
+         gaps_col = c(12), gaps_row = c(4, 10), show_colnames = F, na_col = "gray90")
+```
+
+```{r, eval=T, fig.width=3, fig.height=2}
+heatmap_genes <- subset(tx2gene, external_gene_name %in% c("CD163", "VSIG4", "TXNIP", "CP", "MPZL2", "VWF"))[,c("ensembl_gene_id", "external_gene_name")]
+heatmap_genes <- heatmap_genes[!duplicated(heatmap_genes),]
+rnaseq_vst_subset <- merge(rnaseq_vst, heatmap_genes, by.x=0, by.y=1)
+row.names(rnaseq_vst_subset) <- rnaseq_vst_subset$external_gene_name
+rnaseq_vst_subset <- rnaseq_vst_subset[,!(colnames(rnaseq_vst_subset) %in% c("external_gene_name", "Row.names"))]
+
+rnaseq_vst_subset <- rnaseq_vst_subset[,c(row.names(subset(sampleinfo, treatment=="Control"))[order(subset(sampleinfo, treatment=="Control")$Age)], row.names(subset(sampleinfo, treatment=="COVID"))[order(subset(sampleinfo, treatment=="COVID")$Age)])]
+
+anno_colors <- list(Group = c(Control="gray", COVID="black"),
+                    Age = rev(viridis(13)[5:12]),
+                    #Sex = c(M=inferno(5)[2], F=inferno(5)[4]),
+                    Sex = c(M="blue3", F="red3"))
+
+annotation_col <- data.frame(Group = c(rep("Control", 12), rep("COVID", 12)), 
+                             Age = sampleinfo[colnames(rnaseq_vst_subset), "Age"],
+                             Sex = sampleinfo[colnames(rnaseq_vst_subset), "Sex"],
+                             row.names=colnames(rnaseq_vst_subset))
+
+pheatmap(rnaseq_vst_subset, scale = "row", cluster_cols = F, treeheight_row=0,
+         annotation_col=annotation_col, annotation_colors = anno_colors,
+         cellwidth=10, cellheight=10, 
+         color = c(colorRampPalette(c("blue", "white", "red"))(21)),
+         gaps_col = c(12), show_colnames = F)
+```
+
+# Pathway and ontology analysis
+
+
+```{r, eval=T}
+covid_control_ranks_entrez <- sign(subset(results_match_covid_control, padj < 0.5)[!duplicated(paste0(subset(results_match_covid_control, padj < 0.5)$log2FoldChange, subset(results_match_covid_control, padj < 0.5)$entrezgene_id)),]$log2FoldChange) *
+  -log10(subset(results_match_covid_control, padj < 0.5)[!duplicated(paste0(subset(results_match_covid_control, padj < 0.5)$log2FoldChange, subset(results_match_covid_control, padj < 0.5)$entrezgene_id)),]$padj)
+
+names(covid_control_ranks_entrez) <- as.character(subset(results_match_covid_control, padj < 0.5)[!duplicated(paste0(subset(results_match_covid_control, padj < 0.5)$log2FoldChange, subset(results_match_covid_control, padj < 0.5)$entrezgene_id)),]$entrezgene_id)
+```
+
+```{r, eval=T}
+go.list <- as.list(org.Hs.egGO2ALLEGS)
+go.ont <- sapply(names(go.list), Ontology)
+names(go.ont) <- unlist(strsplit(names(go.ont), "[.]"))[c(T,F)]
+names(go.list) <- sapply(names(go.list), function(x) { paste0(x, "-", unname(Term(x))) })
+
+gobp.list <- go.list[which(go.ont=="BP")]
+```
+
+```{r, eval=T}
+substrLeft <- function(x, n){
+  substr(x, 1, nchar(x)-n)
+}
+path <- gsub("hsa:","",keggLink("hsa","pathway"))
+path <- data.frame(pathway=names(path), gene=as.character(path))
+path <- split(as.character(path$gene), path$pathway)
+p <- c()
+for(i in 1:(length(path) %/% 10)){
+  p <- c(p, sapply(keggGet(names(path)[(i*10-9):(i*10)]), "[[", "NAME"))
+}
+i <- i + 1
+p <- c(p, sapply(keggGet(names(path)[(i*10-9):((i*10-9) + length(path) %% 10 - 1)]), "[[", "NAME"))
+p <- substrLeft(p,23)
+names(path) <- p[1:length(path)]
+```
+
+```{r, eval=T}
+rdb <- reactomePathways(as.character(tx2gene$entrezgene_id))
+```
+
+
+```{r, eval=T}
+set.seed(1)
+fgsea_rdb <- fgsea(pathways=rdb, 
+                   stats=covid_control_ranks_entrez, 
+                   minSize = 5,
+                   nperm=10000)
+fgsea_rdb <- fgsea_rdb[order(fgsea_rdb$NES),]
+fgsea_rdb$pathway <- factor(fgsea_rdb$pathway, levels=unique(fgsea_rdb$pathway))
+
+fgsea_kegg <- fgsea(pathways=path, 
+                   stats=covid_control_ranks_entrez, 
+                   minSize = 5,
+                   nperm=10000)
+fgsea_kegg <- fgsea_kegg[order(fgsea_kegg$NES),]
+fgsea_kegg$pathway <- factor(fgsea_kegg$pathway, levels=unique(fgsea_kegg$pathway))
+
+fgsea_gobp <- fgsea(pathways=gobp.list, 
+                   stats=covid_control_ranks_entrez, 
+                   minSize = 5,
+                   nperm=10000)
+fgsea_gobp <- fgsea_gobp[order(fgsea_gobp$NES),]
+fgsea_gobp$pathway <- factor(fgsea_gobp$pathway, levels=unique(fgsea_gobp$pathway))
+```
+
+
+```{r, eval=T}
+fgsea_gobp <- merge(data.frame(subset(fgsea_gobp, padj < 0.05)[,1:7]), data.frame(cbind(sapply(gobp.list, function(x){length(intersect(x, subset(results_match_covid_control, padj < 0.05 & log2FoldChange < 0 & !is.na(entrezgene_id))$entrezgene_id))}), sapply(gobp.list, function(x){length(intersect(x, subset(results_match_covid_control, padj < 0.05 & log2FoldChange > 0 & !is.na(entrezgene_id))$entrezgene_id))}))), by.x=1, by.y=0)
+colnames(fgsea_gobp)[8:9] <- c("down_degs", "up_degs")
+
+fgsea_kegg <- merge(data.frame(subset(fgsea_kegg, padj < 0.05)[,1:7]), data.frame(cbind(sapply(path, function(x){length(intersect(x, subset(results_match_covid_control, padj < 0.05 & log2FoldChange < 0 & !is.na(entrezgene_id))$entrezgene_id))}), sapply(path, function(x){length(intersect(x, subset(results_match_covid_control, padj < 0.05 & log2FoldChange > 0 & !is.na(entrezgene_id))$entrezgene_id))}))), by.x=1, by.y=0)
+colnames(fgsea_kegg)[8:9] <- c("down_degs", "up_degs")
+
+fgsea_rdb <- merge(data.frame(subset(fgsea_rdb, padj < 0.05)[,1:7]), data.frame(cbind(sapply(rdb, function(x){length(intersect(x, subset(results_match_covid_control, padj < 0.05 & log2FoldChange < 0 & !is.na(entrezgene_id))$entrezgene_id))}), sapply(rdb, function(x){length(intersect(x, subset(results_match_covid_control, padj < 0.05 & log2FoldChange > 0 & !is.na(entrezgene_id))$entrezgene_id))}))), by.x=1, by.y=0)
+colnames(fgsea_rdb)[8:9] <- c("down_degs", "up_degs")
+```
+
+```{r, eval=T}
+write.table(fgsea_gobp, file="pathways_gobp.txt", quote=F, sep='\t', row.names=F)
+write.table(fgsea_kegg, file="pathways_kegg.txt", quote=F, sep='\t', row.names=F)
+write.table(fgsea_rdb, file="pathways_rdb.txt", quote=F, sep='\t', row.names=F)
+```
+
+```{r, eval=T}
+fgsea_gobp <- read.table(file="pathways_gobp.txt", header=T, sep='\t')
+fgsea_kegg <- read.table(file="pathways_kegg.txt", header=T, sep='\t')
+fgsea_rdb <- read.table(file="pathways_rdb.txt", header=T, sep='\t')
+```
+
+```{r, eval=T, fig.width=2.8, fig.height=1.8}
+gobp_pathways <- fgsea_gobp$pathway[which(str_replace_all(fgsea_gobp$pathway, "[-].*", "") %in% c("GO:0007568", "GO:0050890", "GO:0099536", "GO:0002376", "GO:0002253", "GO:0016192", "GO:0006974", "GO:0051932", "GO:0042981", "GO:0001963", "GO:0048167", "GO:0035249", "GO:0007005", "GO:0080134", "GO:0007005", "GO:0055074", "GO:0007613", "GO:0007616", "GO:0007611", "GO:0019222", "GO:0006979", "GO:0007215", "GO:0030073"))]
+
+fgsea_gobp <- fgsea_gobp[order(fgsea_gobp$NES),]
+fgsea_gobp$pathway <- factor(fgsea_gobp$pathway, levels=unique(fgsea_gobp$pathway))
+
+ggplot(subset(fgsea_gobp, pathway %in% gobp_pathways), aes(y = NES, x = pathway)) +
+  geom_segment(yend=0, aes(xend=pathway), lty=3) + theme_classic() + ylab("Normalized Enrichment Score (NES)") + 
+  geom_point(aes(size=size, color=(padj)))  +
+  xlab("Gene Ontology Biological Pathways") + coord_flip() + 
+  theme(legend.position = "right", axis.text.y = element_text(vjust=0.5, size=8)) +
+  guides(size=guide_legend(title="Gene Set Size")) +
+  #scale_color_continuous(low="blue", high="red", name=expression("-Log"[10]*" p-value")) +
+  scale_color_continuous(low="red", high="blue", name="FDR", 
+                         breaks=c(round(min(subset(fgsea_gobp, pathway %in% gobp_pathways)$padj) + 5e-4, 3),
+                                  round(mean(c(min(subset(fgsea_gobp, pathway %in% gobp_pathways)$padj), 
+                                         max(subset(fgsea_gobp, pathway %in% gobp_pathways)$padj))), 3), 
+                                  round(max(subset(fgsea_gobp, pathway %in% gobp_pathways)$padj) - 5e-4, 3))) +
+  ylim(c(-4,4)) + geom_hline(yintercept=0, lwd=0.1)
+```
+
+```{r, eval=T, fig.width=3, fig.height=2}
+kegg_pathways_subset <- c("Coronavirus disease - COVID-19", "Cytokine receptor interaction", "Influenza A", "TNF signaling", "Glutamatergic synapse", "Dopaminergic synapse", "Long-term potentiation", "Synaptic vesicle cycle", "Neuroactive ligand-receptor interaction", "Huntington disease", "Axon guidance", "Pathways of neurodegeneration - mukltiple diseases", "Complement and coagulation cascades", "Cytokine-cytokine receptor interaction", "JAK-STAT signaling pathway", "NF-kappa B signaling pathway")
+
+fgsea_kegg <- fgsea_kegg[order(fgsea_kegg$NES),]
+fgsea_kegg$pathway <- factor(fgsea_kegg$pathway, levels=unique(fgsea_kegg$pathway))
+
+ggplot(subset(fgsea_kegg, pathway %in% kegg_pathways_subset), aes(y = NES, x = pathway)) +
+  geom_segment(yend=0, aes(xend=pathway), lty=3) + theme_classic() + ylab("Normalized Enrichment Score (NES)") + 
+  geom_point(aes(size=size, color=(padj)))  +
+  xlab("Significant KEGG Pathways") + coord_flip() + 
+  theme(legend.position = "right", axis.text.y = element_text(vjust=0.5)) +
+  guides(size=guide_legend(title="Gene Set Size")) +
+  #scale_color_continuous(low="blue", high="red", name=expression("-Log"[10]*" p-value")) +
+#  scale_color_continuous(low="red", high="blue", name="FDR", 
+#                         breaks=c(0.003, 0.005, 0.007, 0.009, 0.01, 0.015)) +
+  scale_color_continuous(low="red", high="blue", name="FDR", 
+                         breaks=c(round(min(subset(fgsea_kegg, pathway %in% kegg_pathways_subset)$padj) + 5e-4, 3),
+                                  round(mean(c(min(subset(fgsea_kegg, pathway %in% kegg_pathways_subset)$padj), 
+                                         max(subset(fgsea_kegg, pathway %in% kegg_pathways_subset)$padj))), 3), 
+                                  round(max(subset(fgsea_kegg, pathway %in% kegg_pathways_subset)$padj) - 5e-4, 3))) +
+  ylim(c(-4,4)) + geom_hline(yintercept=0, lwd=0.1)
+```
+
+```{r, eval=T, fig.width=4, fig.height=2}
+reactome_pathways_subset <- c("Neuronal System", "Protein-protein interactions at synapses", "Transmission across Chemical Synapses", "Neurotransmitter receptors and postsynaptic signal transmission", "GABA synthesis, release, reuptake and degradation", "Activation of NMDA receptors and postsynaptic events", "Unblocking of NMDA receptors, glutamate binding and activation", "Dopamine Neurotransmitter Release Cycle", "Long-term potentiation", "Glutamate binding, activation of AMPA receptors and synaptic plasticity", "Interleukin-4 and Interleukin-13 signaling", "Complement cascade", "Regulation of Complement cascade", "Interleukin-10 singaling", "Interferon alpha/beta signaling", "Viral mRNA Translation", "Influenza Viral RNA Transcription and Regulation", "Influenza Infection", "Innate Immune System")
+
+fgsea_rdb <- fgsea_rdb[order(fgsea_rdb$NES),]
+fgsea_rdb$pathway <- factor(fgsea_rdb$pathway, levels=unique(fgsea_rdb$pathway))
+
+ggplot(subset(fgsea_rdb, pathway %in% reactome_pathways_subset), aes(y = NES, x = pathway)) +
+  geom_segment(yend=0, aes(xend=pathway), lty=3) + theme_classic() + ylab("Normalized Enrichment Score (NES)") + 
+  geom_point(aes(size=size, color=(padj)))  +
+  xlab("Significant Reactome Pathways") + coord_flip() + 
+  theme(legend.position = "right", axis.text.y = element_text(vjust=0.5, size=8)) +
+  guides(size=guide_legend(title="Gene Set Size")) +
+  #scale_color_continuous(low="blue", high="red", name=expression("-Log"[10]*" p-value")) +
+#  scale_color_continuous(low="red", high="blue", name="FDR", 
+#                         breaks=c(0.0037, 0.0038, 0.0039, 0.004, 0.0041)) +
+  scale_color_continuous(low="red", high="blue", name="FDR", 
+                         breaks=c(round(min(subset(fgsea_rdb, pathway %in% reactome_pathways_subset)$padj) + 5e-5, 4),
+                                  round(mean(c(min(subset(fgsea_rdb, pathway %in% reactome_pathways_subset)$padj), 
+                                         max(subset(fgsea_rdb, pathway %in% reactome_pathways_subset)$padj))), 4), 
+                                  round(max(subset(fgsea_rdb, pathway %in% reactome_pathways_subset)$padj) - 5e-5, 4))) +
+  ylim(c(-4,4)) + geom_hline(yintercept=0, lwd=0.1)
+```
+
+```{r, eval=T, fig.width=3, fig.height=3}
+# "GO:0050890-cognition"
+gobp_path <- as.character(fgsea_gobp$pathway[which(str_replace_all(fgsea_gobp$pathway, "[-].*", "") %in% c("GO:0050890"))])
+
+heatmap_genes <- subset(tx2gene, entrezgene_id %in% gobp.list[[gobp_path]])[,c("ensembl_gene_id", "external_gene_name")]
+heatmap_genes <- heatmap_genes[!duplicated(heatmap_genes),]
+heatmap_genes <- subset(heatmap_genes, ensembl_gene_id %in% subset(results_match_covid_control, padj < 0.05)$Row.names)
+rnaseq_vst_subset <- merge(rnaseq_vst, heatmap_genes, by.x=0, by.y=1)
+rnaseq_vst_subset <- rnaseq_vst_subset[!duplicated(rnaseq_vst_subset$external_gene_name),]
+row.names(rnaseq_vst_subset) <- rnaseq_vst_subset$external_gene_name
+rnaseq_vst_subset <- rnaseq_vst_subset[,!(colnames(rnaseq_vst_subset) %in% c("external_gene_name", "Row.names"))]
+
+rnaseq_vst_subset <- rnaseq_vst_subset[,c(row.names(subset(sampleinfo, treatment=="Control"))[order(subset(sampleinfo, treatment=="Control")$Age)], row.names(subset(sampleinfo, treatment=="COVID"))[order(subset(sampleinfo, treatment=="COVID")$Age)])]
+
+rnaseq_vst_subset <- rnaseq_vst_subset[which(!is.na(rowSums(t(scale(t(as.matrix(rnaseq_vst_subset))))))),]
+
+anno_colors <- list(Group = c(Control="gray", COVID="black"),
+                    Age = rev(viridis(13)[5:12]),
+                    Sex = c(M="blue3", F="red3"))
+
+annotation_col <- data.frame(Group = c(rep("Control", 12), rep("COVID", 12)), 
+                             Age = sampleinfo[colnames(rnaseq_vst_subset), "Age"],
+                             Sex = sampleinfo[colnames(rnaseq_vst_subset), "Sex"],
+                             row.names=colnames(rnaseq_vst_subset))
+
+pheatmap(rnaseq_vst_subset, scale = "row", cluster_cols = F, treeheight_row=0,
+         annotation_col=annotation_col, annotation_colors = anno_colors,
+         cellwidth=4, cellheight=5, fontsize=8, fontsize_row=5,
+         color = c(colorRampPalette(c("blue", "white", "red"))(21)),
+         gaps_col = c(12), show_colnames = F, breaks=seq(-4.2, 4.2, 0.4))
+```
+
+```{r, eval=T, fig.width=4, fig.height=3}
+# activation of immune response
+gobp_path <- as.character(fgsea_gobp$pathway[which(str_replace_all(fgsea_gobp$pathway, "[-].*", "") %in% c("GO:0002253"))])
+
+heatmap_genes <- subset(tx2gene, entrezgene_id %in% gobp.list[[gobp_path]])[,c("ensembl_gene_id", "external_gene_name")]
+heatmap_genes <- heatmap_genes[!duplicated(heatmap_genes),]
+heatmap_genes <- subset(heatmap_genes, ensembl_gene_id %in% subset(results_match_covid_control, padj < 0.05)$Row.names)
+rnaseq_vst_subset <- merge(rnaseq_vst, heatmap_genes, by.x=0, by.y=1)
+rnaseq_vst_subset <- rnaseq_vst_subset[!duplicated(rnaseq_vst_subset$external_gene_name),]
+row.names(rnaseq_vst_subset) <- rnaseq_vst_subset$external_gene_name
+rnaseq_vst_subset <- rnaseq_vst_subset[,!(colnames(rnaseq_vst_subset) %in% c("external_gene_name", "Row.names"))]
+
+rnaseq_vst_subset <- rnaseq_vst_subset[,c(row.names(subset(sampleinfo, treatment=="Control"))[order(subset(sampleinfo, treatment=="Control")$Age)], row.names(subset(sampleinfo, treatment=="COVID"))[order(subset(sampleinfo, treatment=="COVID")$Age)])]
+
+rnaseq_vst_subset <- rnaseq_vst_subset[which(!is.na(rowSums(t(scale(t(as.matrix(rnaseq_vst_subset))))))),]
+
+anno_colors <- list(Group = c(Control="gray", COVID="black"),
+                    Age = rev(viridis(13)[5:12]),
+                    Sex = c(M="blue3", F="red3"))
+
+annotation_col <- data.frame(Group = c(rep("Control", 12), rep("COVID", 12)), 
+                             Age = sampleinfo[colnames(rnaseq_vst_subset), "Age"],
+                             Sex = sampleinfo[colnames(rnaseq_vst_subset), "Sex"],
+                             row.names=colnames(rnaseq_vst_subset))
+
+pheatmap(t(rnaseq_vst_subset), scale = "column", cluster_rows = F, treeheight_col=0,
+         annotation_row=annotation_col, annotation_colors = anno_colors,
+         cellwidth=5, cellheight=5, fontsize=8, fontsize_col=5,
+         color = c(colorRampPalette(c("blue", "white", "red"))(21)),
+         gaps_row = c(12), show_rownames = F, breaks=seq(-4.2, 4.2, 0.4))
+```
+
+```{r, eval=T, fig.width=3, fig.height=4}
+# GO:0099536-synaptic signaling
+gobp_path <- as.character(fgsea_gobp$pathway[which(str_replace_all(fgsea_gobp$pathway, "[-].*", "") %in% c("GO:0099536"))])
+
+heatmap_genes <- subset(tx2gene, entrezgene_id %in% gobp.list[[gobp_path]])[,c("ensembl_gene_id", "external_gene_name")]
+heatmap_genes <- heatmap_genes[!duplicated(heatmap_genes),]
+heatmap_genes <- subset(heatmap_genes, ensembl_gene_id %in% subset(results_match_covid_control, padj < 0.05)$Row.names)
+rnaseq_vst_subset <- merge(rnaseq_vst, heatmap_genes, by.x=0, by.y=1)
+rnaseq_vst_subset <- rnaseq_vst_subset[!duplicated(rnaseq_vst_subset$external_gene_name),]
+row.names(rnaseq_vst_subset) <- rnaseq_vst_subset$external_gene_name
+rnaseq_vst_subset <- rnaseq_vst_subset[,!(colnames(rnaseq_vst_subset) %in% c("external_gene_name", "Row.names"))]
+
+rnaseq_vst_subset <- rnaseq_vst_subset[,c(row.names(subset(sampleinfo, treatment=="Control"))[order(subset(sampleinfo, treatment=="Control")$Age)], row.names(subset(sampleinfo, treatment=="COVID"))[order(subset(sampleinfo, treatment=="COVID")$Age)])]
+
+rnaseq_vst_subset <- rnaseq_vst_subset[which(!is.na(rowSums(t(scale(t(as.matrix(rnaseq_vst_subset))))))),]
+
+anno_colors <- list(Group = c(Control="gray", COVID="black"),
+                    Age = rev(viridis(13)[5:12]),
+                    Sex = c(M="blue3", F="red3"))
+
+annotation_col <- data.frame(Group = c(rep("Control", 12), rep("COVID", 12)), 
+                             Age = sampleinfo[colnames(rnaseq_vst_subset), "Age"],
+                             Sex = sampleinfo[colnames(rnaseq_vst_subset), "Sex"],
+                             row.names=colnames(rnaseq_vst_subset))
+
+ph <- pheatmap(rnaseq_vst_subset, scale = "row", cluster_cols = F, treeheight_row=0,
+         annotation_col=annotation_col, annotation_colors = anno_colors,
+         cellwidth=5, cellheight=5, fontsize=8, fontsize_row=5,
+         color = c(colorRampPalette(c("blue", "white", "red"))(21)),
+         gaps_col = c(12), show_colnames = F, breaks=seq(-4.2, 4.2, 0.4))
+
+pheatmap(rnaseq_vst_subset[ph$tree_row$order,][1:(length(ph$tree_row$order)/2),], scale = "row", cluster_cols = F, 
+         cluster_rows = F, treeheight_row=0,
+         annotation_col=annotation_col, annotation_colors = anno_colors,
+         cellwidth=5, cellheight=5, fontsize=8, fontsize_row=5,
+         color = c(colorRampPalette(c("blue", "white", "red"))(21)),
+         gaps_col = c(12), show_colnames = F, breaks=seq(-4.2, 4.2, 0.4))
+
+pheatmap(rnaseq_vst_subset[ph$tree_row$order,][(1+length(ph$tree_row$order)/2):length(ph$tree_row$order),], scale = "row", cluster_cols = F, 
+         cluster_rows = F, treeheight_row=0,
+         annotation_col=annotation_col, annotation_colors = anno_colors,
+         cellwidth=5, cellheight=5, fontsize=8, fontsize_row=5,
+         color = c(colorRampPalette(c("blue", "white", "red"))(21)),
+         gaps_col = c(12), show_colnames = F, breaks=seq(-4.2, 4.2, 0.4))
+```
+
+# Collating aging-related gene signatures
+
+```{r, eval=F}
+# from Lu et al. 2004
+# https://static-content.springer.com/esm/art%3A10.1038%2Fnature02661/MediaObjects/41586_2004_BFnature02661_MOESM5_ESM.xls
+# Genes/probes pre-filtered by q-value < 0.01
+lu_genes <- read.csv(file="../yanker_genes_2003.csv", header=T)
+lu_genes <- merge(lu_genes, 
+                      getBM(attributes = c("affy_hg_u95av2", "ensembl_gene_id", "external_gene_name"), 
+            mart = useDataset("hsapiens_gene_ensembl", useMart("ensembl"))), by=1)
+```
+
+```{r, eval=F}
+# from Loerch et al. Plos ONE 2008
+# https://doi.org/10.1371/journal.pone.0003329.s007
+# Genes/probes pre-filtered by q-value < 0.01
+loerch_genes <- read.csv(file="../COVID-19_project/Loerch Yanker 2008 aging regulated genes humans.csv", header=T, skip=13)
+loerch_genes <- merge(loerch_genes, 
+                      getBM(attributes = c("affy_hg_u133_plus_2", "ensembl_gene_id", "external_gene_name"), 
+            mart = useDataset("hsapiens_gene_ensembl", useMart("ensembl"))), by=1)
+```
+
+```{r, eval=F}
+# from Zullo et al. Nature 2019
+# https://static-content.springer.com/esm/art%3A10.1038%2Fs41586-019-1647-8/MediaObjects/41586_2019_1647_MOESM3_ESM.zip
+rosmap_deg <- read.csv(file="../COVID-19_project/sup-table-1-rosmap-degs.csv", header=T)
+cmc_deg <- read.csv(file="../COVID-19_project/sup-table-3-cmc-degs.csv", header=T)
+gibbs_deg <- read.csv(file="../COVID-19_project/sup-table-5-gibbs-degs.csv", header=T)
+
+rosmap_deg <- subset(rosmap_deg, geneSymbol %in% tx2gene$external_gene_name)
+cmc_deg <- subset(cmc_deg, geneSymbol %in% tx2gene$external_gene_name)
+gibbs_deg <- subset(gibbs_deg, geneSymbol %in% tx2gene$external_gene_name)
+```
+
+```{r, eval=F}
+# testing for overlaps to avoid potential gene ID collisions
+aging_genesets <- list(rosmap_up = setdiff(subset(rosmap_deg, FDR < 0.05 & logFC > 0)$geneSymbol, 
+                                           subset(rosmap_deg, FDR < 0.05 & logFC < 0)$geneSymbol),
+                       rosmap_dn = setdiff(subset(rosmap_deg, FDR < 0.05 & logFC < 0)$geneSymbol, 
+                                           subset(rosmap_deg, FDR < 0.05 & logFC > 0)$geneSymbol),
+                       cmc_up = setdiff(subset(cmc_deg, FDR < 0.05 & logFC > 0)$geneSymbol, 
+                                        subset(cmc_deg, FDR < 0.05 & logFC < 0)$geneSymbol),
+                       cmc_dn = setdiff(subset(cmc_deg, FDR < 0.05 & logFC < 0)$geneSymbol, 
+                                        subset(cmc_deg, FDR < 0.05 & logFC > 0)$geneSymbol),
+                       gibbs_up = setdiff(subset(gibbs_deg, adj.P.Val < 0.05 & logFC > 0)$geneSymbol, 
+                                          subset(gibbs_deg, adj.P.Val < 0.05 & logFC < 0)$geneSymbol),
+                       gibbs_dn = setdiff(subset(gibbs_deg, adj.P.Val < 0.05 & logFC < 0)$geneSymbol, 
+                                          subset(gibbs_deg, adj.P.Val < 0.05 & logFC > 0)$geneSymbol),
+                       lu_up = setdiff(subset(lu_genes, Fold.Change > 0)$external_gene_name, 
+                                       subset(lu_genes, Fold.Change < 0)$external_gene_name),
+                       lu_dn = setdiff(subset(lu_genes, Fold.Change < 0)$external_gene_name, 
+                                       subset(lu_genes, Fold.Change > 0)$external_gene_name),
+                       loerch_up = setdiff(subset(loerch_genes, fold.change > 0)$external_gene_name, 
+                                           subset(loerch_genes, fold.change < 0)$external_gene_name),
+                       loerch_dn = setdiff(subset(loerch_genes, fold.change < 0)$external_gene_name, 
+                                           subset(loerch_genes, fold.change > 0)$external_gene_name))
+```
+
+```{r, eval=F}
+write.table(file="master_aging_genesets.txt", 
+            data.frame(rbind(cbind(Geneset="ROSMAP Upregulated Genes", Genes=aging_genesets$rosmap_up),
+                             cbind(Geneset="ROSMAP Downregulated Genes", Genes=aging_genesets$rosmap_dn),
+                             cbind(Geneset="CMC Upregulated Genes", Genes=aging_genesets$cmc_up),
+                             cbind(Geneset="CMC Downregulated Genes", Genes=aging_genesets$cmc_dn),
+                             cbind(Geneset="Gibbs Upregulated Genes", Genes=aging_genesets$gibbs_up),
+                             cbind(Geneset="Gibbs Downregulated Genes", Genes=aging_genesets$gibbs_dn),
+                             cbind(Geneset="Lu et al. Upregulated Genes", Genes=aging_genesets$lu_up),
+                             cbind(Geneset="Lu et al. Downregulated Genes", Genes=aging_genesets$lu_dn),
+                             cbind(Geneset="Loerch et al. Upregulated Genes", Genes=aging_genesets$loerch_up),
+                             cbind(Geneset="Loerch et al. Downregulated Genes", Genes=aging_genesets$loerch_dn))), 
+            quote=F, sep='\t', row.names=F)
+```
+
+```{r, eval=T}
+# from supplementary table S4a
+aging_genesets <- read.table(file="master_aging_genesets.txt", header=T, sep='\t')
+aging_genesets <- list(rosmap_up = subset(aging_genesets, Geneset =="ROSMAP Upregulated Genes")$Genes,
+                       rosmap_dn = subset(aging_genesets, Geneset =="ROSMAP Downregulated Genes")$Genes,
+                       cmc_up = subset(aging_genesets, Geneset =="CMC Upregulated Genes")$Genes,
+                       cmc_dn = subset(aging_genesets, Geneset =="CMC Downregulated Genes")$Genes,
+                       gibbs_up = subset(aging_genesets, Geneset =="Gibbs Upregulated Genes")$Genes,
+                       gibbs_dn = subset(aging_genesets, Geneset =="Gibbs Downregulated Genes")$Genes, 
+                       lu_up = subset(aging_genesets, Geneset =="Lu et al. Upregulated Genes")$Genes,
+                       lu_dn = subset(aging_genesets, Geneset =="Lu et al. Downregulated Genes")$Genes,
+                       loerch_up = subset(aging_genesets, Geneset =="Loerch et al. Upregulated Genes")$Genes,
+                       loerch_dn = subset(aging_genesets, Geneset =="Loerch et al. Downregulated Genes")$Genes)
+```
+
+```{r, eval=T}
+write.table(file="aging_rosmap_up_degs.txt", sort(intersect(subset(results_match_covid_control, padj < 0.05 & log2FoldChange > 0)$external_gene_name, aging_genesets$rosmap_up)), quote=F, row.names=F, col.names=F)
+write.table(file="aging_rosmap_dn_degs.txt", sort(intersect(subset(results_match_covid_control, padj < 0.05 & log2FoldChange < 0)$external_gene_name, aging_genesets$rosmap_dn)), quote=F, row.names=F, col.names=F)
+
+write.table(file="aging_cmc_up_degs.txt", sort(intersect(subset(results_match_covid_control, padj < 0.05 & log2FoldChange > 0)$external_gene_name, aging_genesets$cmc_up)), quote=F, row.names=F, col.names=F)
+write.table(file="aging_cmc_dn_degs.txt", sort(intersect(subset(results_match_covid_control, padj < 0.05 & log2FoldChange < 0)$external_gene_name, aging_genesets$cmc_dn)), quote=F, row.names=F, col.names=F)
+
+write.table(file="aging_gibbs_up_degs.txt", sort(intersect(subset(results_match_covid_control, padj < 0.05 & log2FoldChange > 0)$external_gene_name, aging_genesets$gibbs_up)), quote=F, row.names=F, col.names=F)
+write.table(file="aging_gibbs_dn_degs.txt", sort(intersect(subset(results_match_covid_control, padj < 0.05 & log2FoldChange < 0)$external_gene_name, aging_genesets$gibbs_dn)), quote=F, row.names=F, col.names=F)
+
+write.table(file="aging_lu_up_degs.txt", sort(intersect(subset(results_match_covid_control, padj < 0.05 & log2FoldChange > 0)$external_gene_name, aging_genesets$lu_up)), quote=F, row.names=F, col.names=F)
+write.table(file="aging_lu_dn_degs.txt", sort(intersect(subset(results_match_covid_control, padj < 0.05 & log2FoldChange < 0)$external_gene_name, aging_genesets$lu_dn)), quote=F, row.names=F, col.names=F)
+
+write.table(file="aging_loerch_up_degs.txt", sort(intersect(subset(results_match_covid_control, padj < 0.05 & log2FoldChange > 0)$external_gene_name, aging_genesets$loerch_up)), quote=F, row.names=F, col.names=F)
+write.table(file="aging_loerch_dn_degs.txt", sort(intersect(subset(results_match_covid_control, padj < 0.05 & log2FoldChange < 0)$external_gene_name, aging_genesets$loerch_dn)), quote=F, row.names=F, col.names=F)
+
+```
+
+
+# Aging analysis
+
+```{r, eval=T}
+ranks_match_covid_control <- -log10(subset(results_match_covid_control, padj < 0.5)$padj) * sign(subset(results_match_covid_control, padj < 0.5)$log2FoldChange)
+names(ranks_match_covid_control) <- subset(results_match_covid_control, padj < 0.5)$external_gene_name
+```
+
+```{r, eval=T}
+set.seed(1)
+fgsea_match_covid_control <- fgsea(pathways=aging_genesets, stats=ranks_match_covid_control, nPermSimple = 10000, eps=0)
+fgsea_match_covid_control
+```
+
+```{r, eval=T, fig.width=1.5, fig.height=1.2}
+set.seed(1)
+plotEnrichment(aging_genesets$lu_up, ranks_match_covid_control) + xlab(paste0("COVID vs Control\nLu et al. Up Genes\nNES = ", signif(subset(data.frame(fgsea_match_covid_control[,1:7]), pathway=="lu_up")$NES, 4), "\np = ", signif(subset(data.frame(fgsea_match_covid_control[,1:7]), pathway=="lu_up")$pval, 3))) + ylab("Enrichment Score")
+
+plotEnrichment(aging_genesets$lu_dn, ranks_match_covid_control) + xlab(paste0("COVID vs Control\nLu et al. Down Genes\nNES = ", signif(subset(data.frame(fgsea_match_covid_control[,1:7]), pathway=="lu_dn")$NES, 4), "\np = ", signif(subset(data.frame(fgsea_match_covid_control[,1:7]), pathway=="lu_dn")$pval, 3))) + ylab("Enrichment Score")
+
+plotEnrichment(aging_genesets$loerch_up, ranks_match_covid_control) + xlab(paste0("COVID vs Control\nLoerch et al. Up Genes\nNES = ", signif(subset(data.frame(fgsea_match_covid_control[,1:7]), pathway=="loerch_up")$NES, 4), "\np = ", signif(subset(data.frame(fgsea_match_covid_control[,1:7]), pathway=="loerch_up")$pval, 3))) + ylab("Enrichment Score")
+
+plotEnrichment(aging_genesets$loerch_dn, ranks_match_covid_control) + xlab(paste0("COVID vs Control\nLoerch et al. Down Genes\nNES = ", signif(subset(data.frame(fgsea_match_covid_control[,1:7]), pathway=="loerch_dn")$NES, 4), "\np = ", formatC(subset(data.frame(fgsea_match_covid_control[,1:7]), pathway=="loerch_dn")$pval, format="e", digits=2))) + ylab("Enrichment Score")
+
+plotEnrichment(aging_genesets$rosmap_up, ranks_match_covid_control) + xlab(paste0("COVID vs Control\nRosMap Up Genes\nNES = ", signif(subset(data.frame(fgsea_match_covid_control[,1:7]), pathway=="rosmap_up")$NES, 4), "\np = ", signif(subset(data.frame(fgsea_match_covid_control[,1:7]), pathway=="rosmap_up")$pval, 3))) + ylab("Enrichment Score")
+
+plotEnrichment(aging_genesets$rosmap_dn, ranks_match_covid_control) + xlab(paste0("COVID vs Control\nRosMap Down Genes\nNES = ", signif(subset(data.frame(fgsea_match_covid_control[,1:7]), pathway=="rosmap_dn")$NES, 4), "\np = ", signif(subset(data.frame(fgsea_match_covid_control[,1:7]), pathway=="rosmap_dn")$pval, 3))) + ylab("Enrichment Score")
+
+plotEnrichment(aging_genesets$cmc_up, ranks_match_covid_control) + xlab(paste0("COVID vs Control\nCMC Up Genes\nNES = ", signif(subset(data.frame(fgsea_match_covid_control[,1:7]), pathway=="cmc_up")$NES, 4), "\np = ", signif(subset(data.frame(fgsea_match_covid_control[,1:7]), pathway=="cmc_up")$pval, 3))) + ylab("Enrichment Score")
+
+plotEnrichment(aging_genesets$cmc_dn, ranks_match_covid_control) + xlab(paste0("COVID vs Control\nCMC Down Genes\nNES = ", signif(subset(data.frame(fgsea_match_covid_control[,1:7]), pathway=="cmc_dn")$NES, 4), "\np = ", signif(subset(data.frame(fgsea_match_covid_control[,1:7]), pathway=="cmc_dn")$pval, 3))) + ylab("Enrichment Score")
+
+plotEnrichment(aging_genesets$gibbs_up, ranks_match_covid_control) + xlab(paste0("COVID vs Control\nGibbs Up Genes\nNES = ", signif(subset(data.frame(fgsea_match_covid_control[,1:7]), pathway=="gibbs_up")$NES, 4), "\np = ", signif(subset(data.frame(fgsea_match_covid_control[,1:7]), pathway=="gibbs_up")$pval, 3))) + ylab("Enrichment Score")
+
+plotEnrichment(aging_genesets$gibbs_dn, ranks_match_covid_control) + xlab(paste0("COVID vs Control\nGibbs Down Genes\nNES = ", signif(subset(data.frame(fgsea_match_covid_control[,1:7]), pathway=="gibbs_dn")$NES, 4), "\np = ", signif(subset(data.frame(fgsea_match_covid_control[,1:7]), pathway=="gibbs_dn")$pval, 3))) + ylab("Enrichment Score")
+```
+
+```{r, eval=T}
+set.seed(1)
+fgsea(pathways=list(aging=c("CD163", "VSIG4", "TXNIP", "CP", "MPZL2", "VWF")), stats=ranks_match_covid_control, nPermSimple = 10000, eps=0)
+```
+
+
+```{r, eval=T}
+set.seed(1)
+rnaseq_dds_65under <- DESeqDataSetFromTximport(txi_65under, colData = sampleinfo[which(sampleinfo$age65 == 0),], design = ~treatment)
+rnaseq_dds_over65 <- DESeqDataSetFromTximport(txi_over65, colData = sampleinfo[which(sampleinfo$age65 == 1),], design = ~treatment)
+
+rnaseq_dds_65under <- DESeq(rnaseq_dds_65under)
+rnaseq_dds_over65 <- DESeq(rnaseq_dds_over65)
+```
+
+```{r, eval=T, echo=F}
+set.seed(1)
+results_covid_control_65under <- results(rnaseq_dds_65under,contrast=c("treatment","COVID", "Control"))
+results_covid_control_over65 <- results(rnaseq_dds_over65,contrast=c("treatment","COVID", "Control"))
+
+results_covid_control_65under <- merge(data.frame(results_covid_control_65under), tx2gene[!duplicated(tx2gene[,c(2,3,4)]),c(2,3,4)], by.x=0, by.y=1)
+results_covid_control_over65 <- merge(data.frame(results_covid_control_over65), tx2gene[!duplicated(tx2gene[,c(2,3,4)]),c(2,3,4)], by.x=0, by.y=1)
+```
+
+```{r, eval=T}
+df.write <- results_covid_control_65under
+colnames(df.write)[1] <- "ensembl_gene_id"
+df.write <- df.write[!duplicated(df.write[,1:8]),1:8]
+write.table(df.write, file="rnaseq_covid_control_65under.txt", quote=F, row.names=F, sep='\t')
+
+df.write <- results_covid_control_over65
+colnames(df.write)[1] <- "ensembl_gene_id"
+df.write <- df.write[!duplicated(df.write[,1:8]),1:8]
+write.table(df.write, file="rnaseq_covid_control_over65.txt", quote=F, row.names=F, sep='\t')
+```
+
+
+```{r, eval=T, fig.width=2.3, fig.height=2}
+ggplot(results_covid_control_65under, aes(x=log2FoldChange, y=-log10(padj))) + geom_point(pch=20, color="lightgray", alpha=0.5, data=subset(results_covid_control_65under, padj > 0.05)) + geom_point(pch=20, color="indianred", data=subset(results_covid_control_65under, padj < 0.05 & log2FoldChange > 0), alpha=0.5) + geom_point(pch=20, color="skyblue", data=subset(results_covid_control_65under, padj < 0.05 & log2FoldChange < 0), alpha=0.5) + theme_classic()+ geom_hline(yintercept=0, lty=3) +
+  geom_hline(yintercept=-log10(0.05), lty=3, color="red") + geom_vline(xintercept=0, lty=3, color="red") + ylab("-Log10 FDR") + xlab(paste0("Log2 Fold Change,\nCOVID vs. Control, Age ", as.character(expression("\u2264")), " 65")) + xlim(c(-10,10)) + ylim(c(-1,15)) + geom_text_repel(data=results_covid_control_65under[which(results_covid_control_65under$external_gene_name %in% c("SST", "FABP3", "CORO1A", "SYNGR1", "DGKZ", "PON2", "MYL12A", "TIMP1", "H1-3", "MT2A", "S100A9", "S100A8", "IFITM1", "IFITM2", "IFITM3", "INPP4A", "GRIA1", "RHOBTB3", "GRIN3A", "MYL12A", "CALM3", "BCAP29") & results_covid_control_65under$padj < 0.05),], aes(label=external_gene_name), size=3, segment.alpha=0.5, force = 1, box.padding=0.1, max.overlaps=50) + geom_point(data=results_covid_control_65under[which(results_covid_control_65under$external_gene_name %in% c("SST", "FABP3", "CORO1A", "SYNGR1", "DGKZ", "PON2", "MYL12A", "TIMP1", "H1-3", "MT2A", "S100A9", "S100A8", "IFITM1", "IFITM2", "IFITM3", "INPP4A", "GRIA1", "RHOBTB3", "GRIN3A", "MYL12A", "CALM3", "BCAP29") & results_covid_control_65under$padj < 0.05),], color="black", size=1)
+```
+
+```{r, eval=T, fig.width=2.3, fig.height=2}
+ggplot(results_covid_control_over65, aes(x=log2FoldChange, y=-log10(padj))) + geom_point(pch=20, color="lightgray", alpha=0.5, data=subset(results_covid_control_over65, padj > 0.05)) + geom_point(pch=20, color="indianred", data=subset(results_covid_control_over65, padj < 0.05 & log2FoldChange > 0), alpha=0.5) + geom_point(pch=20, color="skyblue", data=subset(results_covid_control_over65, padj < 0.05 & log2FoldChange < 0), alpha=0.5) + theme_classic()+ geom_hline(yintercept=0, lty=3) +
+  geom_hline(yintercept=-log10(0.05), lty=3, color="red") + geom_vline(xintercept=0, lty=3, color="red") + ylab("-Log10 FDR") + xlab(paste0("Log2 Fold Change,\nCOVID vs. Control, Age > 65")) + xlim(c(-10,10)) + ylim(c(-1,15)) + geom_text_repel(data=results_covid_control_over65[which(results_covid_control_over65$external_gene_name %in% c("SST", "FABP3", "CORO1A", "SYNGR1", "DGKZ", "PON2", "MYL12A", "TIMP1", "H1-3", "MT2A", "S100A9", "S100A8", "IFITM1", "IFITM2", "IFITM3", "SLC14A1", "HIF3A", "PAPLN", "RGS5", "SERGEF", "NCL", "ZNF622", "HBA2", "HBB", "HBA1", "INPP4A", "GRIA1", "RHOBTB3", "GRIN3A", "MYL12A", "CALM3") & results_covid_control_over65$padj < 0.05),], aes(label=external_gene_name), segment.alpha=0.5, force = 1, box.padding=0.1, max.overlaps=50, size=3) + geom_point(data=results_covid_control_over65[which(results_covid_control_over65$external_gene_name %in% c("SST", "FABP3", "CORO1A", "SYNGR1", "DGKZ", "PON2", "MYL12A", "TIMP1", "H1-3", "MT2A", "S100A9", "S100A8", "IFITM1", "IFITM2", "IFITM3", "SLC14A1", "HIF3A", "PAPLN", "RGS5", "SERGEF", "NCL", "ZNF622", "HBA2", "HBB", "HBA1", "INPP4A", "GRIA1", "RHOBTB3", "GRIN3A", "MYL12A", "CALM3") & results_covid_control_over65$padj < 0.05),], color="black", size=1)
+```
+
+```{r, eval=T}
+ranks_covid_control_65under <- -log10(subset(results_covid_control_65under, padj < 0.5)$padj) * sign(subset(results_covid_control_65under, padj < 0.5)$log2FoldChange)
+names(ranks_covid_control_65under) <- subset(results_covid_control_65under, padj < 0.5)$external_gene_name
+```
+
+```{r, eval=T}
+set.seed(1)
+fgsea_covid_control_65under <- fgsea(pathways=aging_genesets, stats=ranks_covid_control_65under, nPermSimple = 10000, eps=0)
+fgsea_covid_control_65under
+```
+
+```{r, eval=T, fig.width=1.3, fig.height=1.2}
+set.seed(1)
+plotEnrichment(aging_genesets$lu_up, ranks_covid_control_65under) + xlab(paste0("COVID vs Control, Age ", as.character(expression("\u2264")), " 65\nLu et al. Up Genes\nNES = ", signif(subset(data.frame(fgsea_covid_control_65under[,1:7]), pathway=="lu_up")$NES, 4), "\np = ", signif(subset(data.frame(fgsea_covid_control_65under[,1:7]), pathway=="lu_up")$pval, 3))) + ylab("Enrichment Score")
+
+plotEnrichment(aging_genesets$lu_dn, ranks_covid_control_65under) + xlab(paste0("COVID vs Control, Age ", as.character(expression("\u2264")), " 65\nLu et al. Down Genes\nNES = ", signif(subset(data.frame(fgsea_covid_control_65under[,1:7]), pathway=="lu_dn")$NES, 4), "\np = ", signif(subset(data.frame(fgsea_covid_control_65under[,1:7]), pathway=="lu_dn")$pval, 3))) + ylab("Enrichment Score")
+
+plotEnrichment(aging_genesets$loerch_up, ranks_covid_control_65under) + xlab(paste0("COVID vs Control, Age ", as.character(expression("\u2264")), " 65\nLoerch et al. Up Genes\nNES = ", signif(subset(data.frame(fgsea_covid_control_65under[,1:7]), pathway=="loerch_up")$NES, 4), "\np = ", signif(subset(data.frame(fgsea_covid_control_65under[,1:7]), pathway=="loerch_up")$pval, 3))) + ylab("Enrichment Score")
+
+plotEnrichment(aging_genesets$loerch_dn, ranks_covid_control_65under) + xlab(paste0("COVID vs Control, Age ", as.character(expression("\u2264")), " 65\nLoerch et al. Down Genes\nNES = ", signif(subset(data.frame(fgsea_covid_control_65under[,1:7]), pathway=="loerch_dn")$NES, 4), "\np = ", formatC(subset(data.frame(fgsea_covid_control_65under[,1:7]), pathway=="loerch_dn")$pval, format="e", digits=2))) + ylab("Enrichment Score")
+```
+
+```{r, eval=T, fig.width=1.5, fig.height=1.2}
+set.seed(1)
+plotEnrichment(aging_genesets$rosmap_up, ranks_covid_control_65under) + xlab(paste0("COVID vs Control, Age ", as.character(expression("\u2264")), " 65\nRosMap Up\nNES = ", signif(subset(data.frame(fgsea_covid_control_65under[,1:7]), pathway=="rosmap_up")$NES, 4), "\np = ", signif(subset(data.frame(fgsea_covid_control_65under[,1:7]), pathway=="rosmap_up")$pval, 3))) + ylab("Enrichment Score")
+
+plotEnrichment(aging_genesets$rosmap_dn, ranks_covid_control_65under) + xlab(paste0("COVID vs Control, Age ", as.character(expression("\u2264")), " 65\nRosMap Down\nNES = ", signif(subset(data.frame(fgsea_covid_control_65under[,1:7]), pathway=="rosmap_dn")$NES, 4), "\np = ", signif(subset(data.frame(fgsea_covid_control_65under[,1:7]), pathway=="rosmap_dn")$pval, 3))) + ylab("Enrichment Score")
+
+plotEnrichment(aging_genesets$cmc_up, ranks_covid_control_65under) + xlab(paste0("COVID vs Control, Age ", as.character(expression("\u2264")), " 65\nCMC Up\nNES = ", signif(subset(data.frame(fgsea_covid_control_65under[,1:7]), pathway=="cmc_up")$NES, 4), "\np = ", signif(subset(data.frame(fgsea_covid_control_65under[,1:7]), pathway=="cmc_up")$pval, 3))) + ylab("Enrichment Score")
+
+plotEnrichment(aging_genesets$cmc_dn, ranks_covid_control_65under) + xlab(paste0("COVID vs Control, Age ", as.character(expression("\u2264")), " 65\nCMC Down\nNES = ", signif(subset(data.frame(fgsea_covid_control_65under[,1:7]), pathway=="cmc_dn")$NES, 4), "\np = ", signif(subset(data.frame(fgsea_covid_control_65under[,1:7]), pathway=="cmc_dn")$pval, 3))) + ylab("Enrichment Score")
+
+plotEnrichment(aging_genesets$gibbs_up, ranks_covid_control_65under) + xlab(paste0("COVID vs Control, Age ", as.character(expression("\u2264")), " 65\nGibbs Up\nNES = ", signif(subset(data.frame(fgsea_covid_control_65under[,1:7]), pathway=="gibbs_up")$NES, 4), "\np = ", signif(subset(data.frame(fgsea_covid_control_65under[,1:7]), pathway=="gibbs_up")$pval, 3))) + ylab("Enrichment Score")
+
+plotEnrichment(aging_genesets$gibbs_dn, ranks_covid_control_65under) + xlab(paste0("COVID vs Control, Age ", as.character(expression("\u2264")), " 65\nGibbs Down\nNES = ", signif(subset(data.frame(fgsea_covid_control_65under[,1:7]), pathway=="gibbs_dn")$NES, 4), "\np = ", signif(subset(data.frame(fgsea_covid_control_65under[,1:7]), pathway=="gibbs_dn")$pval, 3))) + ylab("Enrichment Score")
+```
+
+# Sex analysis
+
+```{r, eval=T, fig.width=2, fig.height=1.5}
+ggplot(tsne_lr, aes(dim1, dim2)) + geom_point(aes(color=Treatment, pch=Sex), size=3) + theme_classic() + xlab("TSNE Dimension 1") + ylab("TSNE Dimension 2") + scale_color_manual(labels = c("Control", "COVID"), values=gg_color_hue(2)) #+ theme(legend.position = "none")
+```
+
+```{r, eval=T}
+set.seed(1)
+rnaseq_dds_male <- DESeqDataSetFromTximport(txi_male, colData = sampleinfo[which(sampleinfo$Sex=="M"),], design = ~treatment)
+rnaseq_dds_female <- DESeqDataSetFromTximport(txi_female, colData = sampleinfo[which(sampleinfo$Sex=="F"),], design = ~treatment)
+
+rnaseq_dds_male  <- DESeq(rnaseq_dds_male)
+rnaseq_dds_female<- DESeq(rnaseq_dds_female)
+```
+
+```{r, eval=T, echo=F}
+set.seed(1)
+results_covid_control_male <- results(rnaseq_dds_male,contrast=c("treatment","COVID", "Control"))
+results_covid_control_female <- results(rnaseq_dds_female,contrast=c("treatment","COVID", "Control"))
+
+results_covid_control_male <- merge(data.frame(results_covid_control_male), tx2gene[!duplicated(tx2gene[,c(2,3,4)]),c(2,3,4)], by.x=0, by.y=1)
+results_covid_control_female <- merge(data.frame(results_covid_control_female), tx2gene[!duplicated(tx2gene[,c(2,3,4)]),c(2,3,4)], by.x=0, by.y=1)
+```
+
+```{r, eval=T, fig.width=2.3, fig.height=2}
+ggplot(results_covid_control_male, aes(x=log2FoldChange, y=-log10(padj))) + geom_point(pch=20, color="lightgray", alpha=0.5, data=subset(results_covid_control_male, padj > 0.05)) + geom_point(pch=20, color="indianred", data=subset(results_covid_control_male, padj < 0.05 & log2FoldChange > 0), alpha=0.5) + geom_point(pch=20, color="skyblue", data=subset(results_covid_control_male, padj < 0.05 & log2FoldChange < 0), alpha=0.5) + theme_classic()+ geom_hline(yintercept=0, lty=3) +
+  geom_hline(yintercept=-log10(0.05), lty=3, color="red") + geom_vline(xintercept=0, lty=3, color="red") + ylab("-Log10 FDR") + xlab(paste0("Log2 Fold Change,\nCOVID vs. Control, Male")) + xlim(c(-9,9)) + ylim(c(-0.3,8)) + geom_text_repel(data=results_covid_control_male[which(results_covid_control_male$external_gene_name %in% c("SST", "FABP3", "CORO1A", "SYNGR1", "DGKZ", "PON2", "MYL12A", "TIMP1", "H1-3", "MT2A", "S100A9", "S100A8", "IFITM1", "IFITM2", "IFITM3", "INPP4A", "GRIA1", "RHOBTB3", "GRIN3A", "MYL12A", "CALM3") & results_covid_control_male$padj < 0.05),], aes(label=external_gene_name), size=3, segment.alpha=0.5, force = 1, box.padding=0.1, max.overlaps=50) + geom_point(data=results_covid_control_male[which(results_covid_control_male$external_gene_name %in% c("SST", "FABP3", "CORO1A", "SYNGR1", "DGKZ", "PON2", "MYL12A", "TIMP1", "H1-3", "MT2A", "S100A9", "S100A8", "IFITM1", "IFITM2", "IFITM3", "INPP4A", "GRIA1", "RHOBTB3", "GRIN3A", "MYL12A", "CALM3") & results_covid_control_male$padj < 0.05),], color="black", size=1)
+```
+
+```{r, eval=T, fig.width=2.3, fig.height=2}
+ggplot(results_covid_control_female, aes(x=log2FoldChange, y=-log10(padj))) + geom_point(pch=20, color="lightgray", alpha=0.5, data=subset(results_covid_control_female, padj > 0.05)) + geom_point(pch=20, color="indianred", data=subset(results_covid_control_female, padj < 0.05 & log2FoldChange > 0), alpha=0.5) + geom_point(pch=20, color="skyblue", data=subset(results_covid_control_female, padj < 0.05 & log2FoldChange < 0), alpha=0.5) + theme_classic()+ geom_hline(yintercept=0, lty=3) +
+  geom_hline(yintercept=-log10(0.05), lty=3, color="red") + geom_vline(xintercept=0, lty=3, color="red") + ylab("-Log10 FDR") + xlab(paste0("Log2 Fold Change,\nCOVID vs. Control, Female")) + xlim(c(-9,9)) + ylim(c(-0.3,8)) + geom_text_repel(data=results_covid_control_female[which(results_covid_control_female$external_gene_name %in% c("SST", "FABP3", "CORO1A", "SYNGR1", "DGKZ", "PON2", "MYL12A", "TIMP1", "H1-3", "MT2A", "S100A9", "S100A8", "IFITM1", "IFITM2", "IFITM3", "INPP4A", "GRIA1", "RHOBTB3", "GRIN3A", "MYL12A", "CALM3") & results_covid_control_female$padj < 0.05),], aes(label=external_gene_name), size=3, segment.alpha=0.5, force = 1, box.padding=0.1, max.overlaps=50) + geom_point(data=results_covid_control_female[which(results_covid_control_female$external_gene_name %in% c("SST", "FABP3", "CORO1A", "SYNGR1", "DGKZ", "PON2", "MYL12A", "TIMP1", "H1-3", "MT2A", "S100A9", "S100A8", "IFITM1", "IFITM2", "IFITM3", "INPP4A", "GRIA1", "RHOBTB3", "GRIN3A", "MYL12A", "CALM3") & results_covid_control_female$padj < 0.05),], color="black", size=1)
+```
+
+```{r, eval=T}
+df.write <- results_covid_control_male
+colnames(df.write)[1] <- "ensembl_gene_id"
+df.write <- df.write[!duplicated(df.write[,1:8]),1:8]
+write.table(df.write, file="rnaseq_covid_control_male.txt", quote=F, row.names=F, sep='\t')
+
+df.write <- results_covid_control_female
+colnames(df.write)[1] <- "ensembl_gene_id"
+df.write <- df.write[!duplicated(df.write[,1:8]),1:8]
+write.table(df.write, file="rnaseq_covid_control_female.txt", quote=F, row.names=F, sep='\t')
+```
+
+```{r, eval=T}
+ranks_covid_control_male <- -log10(subset(results_covid_control_male, padj < 0.5)$padj) * sign(subset(results_covid_control_male, padj < 0.5)$log2FoldChange)
+names(ranks_covid_control_male) <- subset(results_covid_control_male, padj < 0.5)$external_gene_name
+
+ranks_covid_control_female <- -log10(subset(results_covid_control_female, padj < 0.5)$padj) * sign(subset(results_covid_control_female, padj < 0.5)$log2FoldChange)
+names(ranks_covid_control_female) <- subset(results_covid_control_female, padj < 0.5)$external_gene_name
+```
+
+```{r, eval=T}
+set.seed(1)
+fgsea_covid_control_male <- fgsea(pathways=aging_genesets, stats=ranks_covid_control_male, nPermSimple = 10000, eps=0)
+fgsea_covid_control_male
+
+fgsea_covid_control_female <- fgsea(pathways=aging_genesets, stats=ranks_covid_control_female, nPermSimple = 10000, eps=0)
+fgsea_covid_control_female
+```
+
+
+```{r, eval=T, fig.width=1.5, fig.height=1.2}
+set.seed(1)
+plotEnrichment(aging_genesets$lu_up, ranks_covid_control_male) + xlab(paste0("COVID vs Control, Males\nLu et al. Up Genes\nNES = ", signif(subset(data.frame(fgsea_covid_control_male[,1:7]), pathway=="lu_up")$NES, 4), "\np = ", signif(subset(data.frame(fgsea_covid_control_male[,1:7]), pathway=="lu_up")$pval, 3))) + ylab("Enrichment Score")
+
+plotEnrichment(aging_genesets$lu_dn, ranks_covid_control_male) + xlab(paste0("COVID vs Control, Males\nLu et al. Down Genes\nNES = ", signif(subset(data.frame(fgsea_covid_control_male[,1:7]), pathway=="lu_dn")$NES, 4), "\np = ", signif(subset(data.frame(fgsea_covid_control_male[,1:7]), pathway=="lu_dn")$pval, 3))) + ylab("Enrichment Score")
+
+plotEnrichment(aging_genesets$loerch_up, ranks_covid_control_male) + xlab(paste0("COVID vs Control, Males\nLoerch et al. Up Genes\nNES = ", signif(subset(data.frame(fgsea_covid_control_male[,1:7]), pathway=="loerch_up")$NES, 4), "\np = ", signif(subset(data.frame(fgsea_covid_control_male[,1:7]), pathway=="loerch_up")$pval, 3))) + ylab("Enrichment Score")
+
+plotEnrichment(aging_genesets$loerch_dn, ranks_covid_control_male) + xlab(paste0("COVID vs Control, Males\nLoerch et al. Down Genes\nNES = ", signif(subset(data.frame(fgsea_covid_control_male[,1:7]), pathway=="loerch_dn")$NES, 4), "\np = ", signif(subset(data.frame(fgsea_covid_control_male[,1:7]), pathway=="loerch_dn")$pval, 3))) + ylab("Enrichment Score")
+
+```
+
+
+```{r, eval=T, fig.width=1.5, fig.height=1.2}
+set.seed(1)
+plotEnrichment(aging_genesets$lu_up, ranks_covid_control_female) + xlab(paste0("COVID vs Control, Females\nLu et al. Up Genes\nNES = ", signif(subset(data.frame(fgsea_covid_control_female[,1:7]), pathway=="lu_up")$NES, 4), "\np = ", signif(subset(data.frame(fgsea_covid_control_female[,1:7]), pathway=="lu_up")$pval, 3))) + ylab("Enrichment Score")
+
+plotEnrichment(aging_genesets$lu_dn, ranks_covid_control_female) + xlab(paste0("COVID vs Control, Females\nLu et al. Down Genes\nNES = ", signif(subset(data.frame(fgsea_covid_control_female[,1:7]), pathway=="lu_dn")$NES, 4), "\np = ", signif(subset(data.frame(fgsea_covid_control_female[,1:7]), pathway=="lu_dn")$pval, 3))) + ylab("Enrichment Score")
+
+plotEnrichment(aging_genesets$loerch_up, ranks_covid_control_female) + xlab(paste0("COVID vs Control, Females\nLoerch et al. Up Genes\nNES = ", signif(subset(data.frame(fgsea_covid_control_female[,1:7]), pathway=="loerch_up")$NES, 4), "\np = ", signif(subset(data.frame(fgsea_covid_control_female[,1:7]), pathway=="loerch_up")$pval, 3))) + ylab("Enrichment Score")
+
+plotEnrichment(aging_genesets$loerch_dn, ranks_covid_control_female) + xlab(paste0("COVID vs Control, Females\nLoerch et al. Down Genes\nNES = ", signif(subset(data.frame(fgsea_covid_control_female[,1:7]), pathway=="loerch_dn")$NES, 4), "\np = ", signif(subset(data.frame(fgsea_covid_control_female[,1:7]), pathway=="loerch_dn")$pval, 3))) + ylab("Enrichment Score")
+
+```
+
+```{r, eval=T}
+length(unique(subset(results_match_covid_control, padj < 0.05 & log2FoldChange < 0)$Row.names))
+length(unique(subset(results_match_covid_control, padj < 0.05 & log2FoldChange > 0)$Row.names))
+length(unique(subset(results_match_covid_control, padj < 0.05)$Row.names))
+
+length(unique(subset(results_covid_control_over65, padj < 0.05 & log2FoldChange < 0)$Row.names))
+length(unique(subset(results_covid_control_over65, padj < 0.05 & log2FoldChange > 0)$Row.names))
+length(unique(subset(results_covid_control_over65, padj < 0.05)$Row.names))
+
+length(unique(subset(results_covid_control_65under, padj < 0.05 & log2FoldChange < 0)$Row.names))
+length(unique(subset(results_covid_control_65under, padj < 0.05 & log2FoldChange > 0)$Row.names))
+length(unique(subset(results_covid_control_65under, padj < 0.05)$Row.names))
+
+length(unique(subset(results_covid_control_male, padj < 0.05 & log2FoldChange < 0)$Row.names))
+length(unique(subset(results_covid_control_male, padj < 0.05 & log2FoldChange > 0)$Row.names))
+length(unique(subset(results_covid_control_male, padj < 0.05)$Row.names))
+
+length(unique(subset(results_covid_control_female, padj < 0.05 & log2FoldChange < 0)$Row.names))
+length(unique(subset(results_covid_control_female, padj < 0.05 & log2FoldChange > 0)$Row.names))
+length(unique(subset(results_covid_control_female, padj < 0.05)$Row.names))
+```
+
+
+
+```{r, eval=T}
+sessionInfo()
+```
