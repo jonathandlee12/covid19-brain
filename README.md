@@ -10,13 +10,13 @@ Coronavirus disease 2019 (COVID-19) is predominantly an acute respiratory diseas
 
 The available [R markdown file](https://github.com/jonathandlee12/covid19-brain/blob/main/covid19_aging_rscripts_final.Rmd) contains R scripts used to generate all figures and data tables available with the current iteration of the manuscript. The code was last run 11/15/2021. 
 
-## Resources for preprocessing
+## Resources for data preprocessing
 - [SARS-CoV-2 reference genome](https://www.ncbi.nlm.nih.gov/nuccore/1798174254)
 - [Ensembl v104 reference transcriptome](http://ftp.ensembl.org/pub/release-104/fasta/homo_sapiens/cdna/Homo_sapiens.GRCh38.cdna.all.fa.gz)
 - [Calu-3 SARS-CoV-2- and mock-infected transcriptomes (.fastq)](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE147507), accession numbers GSM4462348-GSM4462353
 - [Frontal cortex transcriptome profiles from this manuscript (.fastq)](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE188847)
 
-## Resources for analysis
+## Resources for data analysis
 - [Transcriptome alignment of frontal cortex transcriptome profiles (.sf)](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE188847)
 - [Cohort characteristics](https://github.com/jonathandlee12/covid19-brain/blob/main/TableS1_patient_info.csv) may also be found in Supplementary Table 1
 - [Processed aging datasets](https://github.com/jonathandlee12/covid19-brain/blob/main/master_aging_genesets.txt) may also be found in Supplementary Table 4a, original analysis files may be found below:
