@@ -17,7 +17,7 @@ The available [R markdown file](https://github.com/jonathandlee12/covid19-brain/
 - [Frontal cortex transcriptome profiles from this manuscript (.fastq)](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE188847)
 
 ## Resources for data analysis
-- [Transcriptome alignment of frontal cortex transcriptome profiles (.sf)](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE188847)
+- [Transcriptome alignment files from frontal cortex transcriptome profiles (.sf, 24 files)](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE188847) are required to reproduce this analysis
 - [Cohort characteristics](https://github.com/jonathandlee12/covid19-brain/blob/main/TableS1_patient_info.csv) may also be found in Supplementary Table 1
 - [Processed aging datasets](https://github.com/jonathandlee12/covid19-brain/blob/main/master_aging_genesets.txt) may also be found in Supplementary Table 4a, original analysis files may be found below:
   - [Lu et al. 2004](https://static-content.springer.com/esm/art%3A10.1038%2Fnature02661/MediaObjects/41586_2004_BFnature02661_MOESM5_ESM.xls)
