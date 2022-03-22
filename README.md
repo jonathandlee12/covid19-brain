@@ -1,6 +1,6 @@
 # Severe COVID-19 induces molecular signatures of aging in the human brain
 This repository provides instructions, code, and supplementary data files to reproduce results and figures from our COVID-19 brain aging paper 
-> M Mavrikaki*, JD Lee*, IH Solomon, FJ Slack. Severe COVID-19 induces molecular signatures of aging in the human brain, bioRxiv (2021). 
+> M Mavrikaki*, JD Lee*, IH Solomon, FJ Slack. Severe COVID-19 induces molecular signatures of aging in the human brain, medRxiv (2021). 
 
 ## Abstract
 
