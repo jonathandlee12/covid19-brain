@@ -1,5 +1,4 @@
-# Severe COVID-19 is associated with molecular signatures of aging
-in the human brain
+# Severe COVID-19 is associated with molecular signatures of aging in the human brain
 This repository provides instructions, code, and supplementary data files to reproduce results and figures from our COVID-19 brain aging paper 
 > M Mavrikaki*, JD Lee*, IH Solomon, FJ Slack. Severe COVID-19 is associated with molecular signatures of aging
 in the human brain, Nature Aging (in press, 2022). 
