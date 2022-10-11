@@ -1,10 +1,12 @@
-# Severe COVID-19 induces molecular signatures of aging in the human brain
+# Severe COVID-19 is associated with molecular signatures of aging
+in the human brain
 This repository provides instructions, code, and supplementary data files to reproduce results and figures from our COVID-19 brain aging paper 
-> M Mavrikaki*, JD Lee*, IH Solomon, FJ Slack. Severe COVID-19 induces molecular signatures of aging in the human brain, medRxiv (2021). 
+> M Mavrikaki*, JD Lee*, IH Solomon, FJ Slack. Severe COVID-19 is associated with molecular signatures of aging
+in the human brain, Nature Aging (in press, 2022). 
 
 ## Abstract
 
-Coronavirus disease 2019 (COVID-19) is predominantly an acute respiratory disease caused by severe acute respiratory syndrome coronavirus 2 (SARS-CoV-2) and remains a significant threat to public health. COVID-19 is accompanied by neurological symptoms and cognitive decline, but the molecular mechanisms underlying this effect remain unclear. As aging induces distinct molecular signatures in the brain associated with cognitive decline in healthy populations, we hypothesized that COVID-19 may induce molecular signatures of aging. Here, we performed whole transcriptomic analysis of human frontal cortex, a critical area for cognitive function, in 12 COVID-19 cases and age- and sex-matched uninfected controls. COVID-19 induces profound changes in gene expression, despite the absence of detectable virus in brain tissue. Pathway analysis shows downregulation of genes involved in synaptic function and cognition and upregulation of genes involved in immune processes. Comparison with five independent transcriptomic datasets of aging human frontal cortex reveals striking similarities between aged individuals and severe COVID-19 patients. Critically, individuals below 65 years of age exhibit profound transcriptomic changes not observed among older individuals in our patient cohort. Our data indicate that severe COVID-19 induces molecular signatures of aging in the human brain and emphasize the value of neurological follow-up in recovered individuals.
+As COVID-19 and aging are both accompanied by cognitive decline, we hypothesized that COVID-19 might induce molecular signatures similar to aging. We performed a whole-transcriptome analysis of frontal cortex, a critical area for cognitive function, in COVID-19 patients, age/sex-matched uninfected controls, and uninfected cases with ICU/ventilator treatment. Our findings indicate that COVID-19 is associated with cytokine-induced molecular signatures of brain aging and emphasize the value of neurological follow-up in recovered individuals.
 
 ## Code information
 
