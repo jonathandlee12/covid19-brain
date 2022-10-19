@@ -1,0 +1,21 @@
+Sample ID,Group,Age (years),Sex,Clinical brain diagnosis,Library prep batch,Manner of death,Postmortem Interval (PMI) ,Neuropathological findings,Notes
+Y1,Young,22,Male,Unaffected control,D,Accidental,13,N/A,
+Y2,Young,22,Female,Unaffected control,D,Accidental,9,Unremarkable adult brain,
+Y3,Young,24,Male,Unaffected control,D,Accidental,8,N/A,
+Y4,Young,24,Female,Unaffected control,D,Accidental,9,N/A,
+Y5,Young,27,Female,Unaffected control,D,Natural,26,Unremarkable adult brain ,
+Y6,Young,30,Male,Unaffected control,D,Accidental,20,"Mild-moderate brain swelling (stem/cerebellum), cerebral white matter hyperplasia, perinatal telencephalic leukoencephalopathy",
+Y7,Young,36,Male,Unaffected control,D,Accidental,24,N/A,
+Y8,Young,37,Female,Unaffected control,D,Natural,9,Unremarkable adult brain,
+Y9,Young,38,Male,Unaffected control,D,Accidental,9,N/A,
+Y10,Young,38,Female,Unaffected control,D,Accidental,9,N/A,
+O1,Old,71,Male,Unaffected control,D,Natural,18,Unremarkable adult brain,
+O2,Old,73,Female,Unaffected control,D,Accidental,20,N/A,
+O3,Old,75,Male,Unaffected control,D,Natural,17,"Assessed for Alzheimer's disease neuropathological change: A1 (Thal phase 2), B1 (Braak Stage 1), C2 (CERAD plaque score-moderate)",
+O4,Old,75,Female,Unaffected control,D,Undetermined,24.5,"1. Neurofibrillary degeneration, Braak stage II, with non-neuritic neocortical amyloid plaques. 2. Atherosclerosis, mild.  Comment (by Harvard Brain Tissue Resource Center; HBTRC): Braak staging of neurofibrillary degeneration is based on a scale of I-VI. Stage II is common above age 50 and is usually asymptomatic",* this case is the same with CONTROL9 in the COVID-19 cohort
+O5,Old,78,Male,Unaffected control,D,Accidental,19,Unremarkable adult brain with mild age-related atrophy,
+O6,Old,80,Female,Unaffected control,D,Natural,10,N/A,
+O7,Old,82,Male,Unaffected control,D,Natural,22,"Severe cerebrovascular atherosclerosis, remote infarct (left inferior parietal lobule, 1.5cm)",
+O8,Old,84,Female,Unaffected control,D,Natural,19.25,"1. Neurofibrillary degeneration, Braak stage II, with non-neuritic amyloid plaques and mild amyloid angiopathy. 2. Mild myelin pallor, with corpora amylacea, cerebral deep white matter, and mild arteriosclerosis, arteries of deep white matter",* this case is the same with CONTROL22 in the COVID-19 cohort
+O9,Old,84,Male,Unaffected control,D,Natural,15.5,Structurally normal adult brain with mild small vessel ischemic changes,* this case is the same with CONTROL12 in the COVID-19 cohort; 8 days on ventilator
+O10,Old,100,Male,Unaffected control,D,Natural,6.17,"1.Neurofibrillary degeneration, Braak and Braak stage II, with mild amyloid angiopathy. 2.Mild neuron loss, without neurofibrillary tangles, locus coeruleus. 3.Small vessel cerebrovascular disease with atherosclerosis, arteriosclerosis, arteriolosclerosis, and several minute remote microinfarcts in the prefrontal cortex and cerebellar cortex",
