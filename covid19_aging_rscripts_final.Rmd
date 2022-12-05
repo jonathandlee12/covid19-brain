@@ -57,7 +57,7 @@ In directory rnaseq_covid/:
 - ICUVENT1-9.salmon.sf (9x files, ICU samples), available from GEO
 
 In directory rnaseq_aging/:
-- O1-10.salmon.sf (10x files, old patient samples), available from GEO
+- O1-10.salmon.sf (10x files, old patient samples), available from GEO (NOTE: O8 and CONTROL9 are the same)
 - Y1-10.salmon.sf (10x files, young patient samples), available from GEO
 
 In directory rnaseq_neuron/:
